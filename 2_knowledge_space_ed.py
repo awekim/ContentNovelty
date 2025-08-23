@@ -1,7 +1,15 @@
 import os
+os.environ["XFORMERS_DISABLED"] = "1"   # xFormers FMHA 비활성화
+# os.environ["CUDA_VISIBLE_DEVICES"] = ""  # 필요시 주석 해제: 강제로 CPU만 사용
+import torch
+try:
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
+except Exception:
+    pass
 import pandas as pd
 import numpy as np
-import torch
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 from sklearn.metrics.pairwise import cosine_distances
@@ -24,7 +32,7 @@ print("Device:", device)
 print("Model on:", next(model.parameters()).device)
 
 # ========= Utils =========
-def encode_texts(texts, batch_size=16, max_length=512):
+def encode_texts(texts, batch_size=16, max_length=256):
     """SPECTER CLS 임베딩을 배치로 반환 (np.ndarray, shape=[N, D])."""
     all_vecs = []
     for s in tqdm(range(0, len(texts), batch_size), desc="Embedding"):
