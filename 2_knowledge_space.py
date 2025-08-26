@@ -1,146 +1,237 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 import os
-import json
-from collections import defaultdict
-
-import numpy as np
+os.environ["XFORMERS_DISABLED"] = "1"   # xFormers FMHA deactivate
 import pandas as pd
+import numpy as np
 import torch
+try:
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
+except Exception:
+    pass
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModel
-from sklearn.preprocessing import normalize as sk_normalize
+from transformers import AutoModel, AutoTokenizer
 
-# -------------------------------
-INPUT_FILE = r"D:/DataforPractice/ContentNovelty/1_df_filtered.csv"
-MODEL_PATH = r"D:/LLM/specter"
-OUTPUT_DIR = r"D:/DataforPractice/ContentNovelty/out"
-BATCH_SIZE = 16
-MAX_LENGTH = 512
-NORMALIZE = True   # True면 L2 정규화 수행
-# -------------------------------
+### Settings 
+SAVE_PATH = r"D:/LLM/specter"
+DATA_DIR  = r"D:/DataforPractice/ContentNovelty/"
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+OUT_KNOW_PARQUET = os.path.join(DATA_DIR, "2_knowledge_spaces.parquet")
+OUT_CENT_PARQUET = os.path.join(DATA_DIR, "2_centroids.parquet")
+OUT_EXT_PARQUET  = os.path.join(DATA_DIR, "3_external_with_novelty.parquet")
 
-def load_model(model_path: str):
-    use_cuda = torch.cuda.is_available()
+OUT_KNOW_FEATHER = os.path.join(DATA_DIR, "2_knowledge_spaces.feather")
+OUT_CENT_FEATHER = os.path.join(DATA_DIR, "2_centroids.feather")
+OUT_EXT_FEATHER  = os.path.join(DATA_DIR, "3_external_with_novelty.feather")
 
-    # tokenizer = AutoTokenizer.from_pretrained(model_path)
-    # model = AutoModel.from_pretrained(model_path, torch_dtype=dtype)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-    model = AutoModel.from_pretrained(
-        MODEL_PATH,
-        torch_dtype=torch.float32,          # 호환성 우선
-        attn_implementation="eager"         # flash-attn/xformers 비활성화
-    )
-    
-    device = torch.device('cuda' if use_cuda else 'cpu')
-    model.to(device)
-    model.eval()
-    return tokenizer, model, device
+BATCH_SIZE  = 32
+MAX_LENGTH  = 256   
+NORMALIZE   = True  
+SAVE_KNOW   = True  
 
-@torch.no_grad()
-def encode_batch(texts, tokenizer, model, device, max_length=512):
-    encoded = tokenizer(
-        texts,
-        return_tensors="pt",
-        truncation=True,
-        padding=True,
-        max_length=max_length
-    ).to(device)
+### Dependencies Check
+try:
+    import pyarrow  # noqa: F401
+except Exception as e:
+    raise RuntimeError(
+        "This script saves tables in Parquet/Feather. Please install pyarrow:\n"
+        "    pip install pyarrow"
+    ) from e
 
-    use_amp = (device.type == "cuda")
-    if use_amp:
-        with torch.cuda.amp.autocast():
-            outputs = model(**encoded)
-    else:
-        outputs = model(**encoded)
+### Model Load
+tokenizer = AutoTokenizer.from_pretrained(SAVE_PATH)
+model = AutoModel.from_pretrained(SAVE_PATH)
+model.eval()
 
-    cls = outputs.last_hidden_state[:, 0, :]
-    return cls.detach().cpu().numpy()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+tqdm.write(f"Device: {device} | Model on: {next(model.parameters()).device}")
 
-def main():
-    # Load data
-    df = pd.read_csv(INPUT_FILE)
-    required_cols = ["itemtitle", "abstract", "EU_NUTS_ID", "period", "subject"]
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns in input CSV: {missing}")
+### Functions
+def l2_normalize(mat: np.ndarray, axis=1, eps=1e-12) -> np.ndarray:
+    """Row-wise L2 normalize."""
+    denom = np.sqrt((mat * mat).sum(axis=axis, keepdims=True)) + eps
+    return mat / denom
 
-    # Drop empty abstracts
-    df = df.dropna(subset=["abstract"])
-    df = df[df["abstract"].str.strip() != ""]
-    df = df.reset_index(drop=True)
+def encode_texts(texts, batch_size=BATCH_SIZE, max_length=MAX_LENGTH, normalize=NORMALIZE) -> np.ndarray:
+    """Return np.ndarray [N, D] of CLS embeddings (optionally L2-normalized)."""
+    vecs = []
+    for s in tqdm(range(0, len(texts), batch_size), desc="  Embedding batches", leave=False):
+        batch = texts[s:s+batch_size]
+        inputs = tokenizer(
+            batch, return_tensors="pt", truncation=True,
+            padding=True, max_length=max_length
+        )
+        inputs = {k: v.to(device, non_blocking=True) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = model(**inputs)
+            cls = outputs.last_hidden_state[:, 0, :].detach().cpu().numpy().astype(np.float32)
+        vecs.append(cls)
+    if not vecs:
+        return np.empty((0, model.config.hidden_size), dtype=np.float32)
+    mat = np.vstack(vecs).astype(np.float32)
+    return l2_normalize(mat) if normalize else mat
 
-    # Combine text
-    df["itemtitle"] = df["itemtitle"].fillna("")
-    df["text"] = (df["itemtitle"] + ". " + df["abstract"]).str.strip()
+def vec_to_str(v: np.ndarray) -> str:
+    return " ".join(f"{x:.6f}" for x in v.tolist())
 
-    # Load model
-    tokenizer, model, device = load_model(MODEL_PATH)
+def cosine_distance_from_normalized(v: np.ndarray, c: np.ndarray) -> float:
+    """v, c are L2-normalized: cosine distance = 1 - dot."""
+    return float(1.0 - np.dot(v, c))
 
-    # Embed in batches
-    texts = df["text"].tolist()
-    all_embs = []
-    for i in tqdm(range(0, len(texts), BATCH_SIZE), desc="Embedding documents"):
-        batch_texts = texts[i:i+BATCH_SIZE]
-        embs = encode_batch(batch_texts, tokenizer, model, device, max_length=MAX_LENGTH)
-        all_embs.append(embs)
-    embeddings = np.vstack(all_embs) if len(all_embs) > 0 else np.zeros((0, 768), dtype=np.float32)
+def save_tables(df, parquet_path, feather_path, label=""):
+    if df is None or df.empty:
+        tqdm.write(f"[SAVE] {label}: empty → skipped")
+        return
+    df.to_parquet(parquet_path, index=False)
+    df.reset_index(drop=True).to_feather(feather_path)
+    tqdm.write(f"[SAVE] {label}: {len(df):,} rows\n       - {parquet_path}\n       - {feather_path}")
 
-    if NORMALIZE and embeddings.shape[0] > 0:
-        embeddings = sk_normalize(embeddings, norm="l2", axis=1)
+### Data Load
+affinst = pd.read_csv(os.path.join(DATA_DIR, "affinst_ed.csv"))
+publication = pd.read_csv(os.path.join(DATA_DIR, "publication_ed.csv"))
 
-    # Save baseline outputs
-    np.save(os.path.join(OUTPUT_DIR, "embeddings.npy"), embeddings)
-    df[["EU_NUTS_ID", "period", "subject", "itemtitle"]].to_csv(os.path.join(OUTPUT_DIR, "row_index.csv"), index=False)
+ID_list = affinst['ID'].dropna().unique().tolist()
+tqdm.write(f"Total unique IDs: {len(ID_list):,}")
 
-    # Build knowledge spaces
-    knowledge_spaces = defaultdict(list)
-    for idx, row in df.iterrows():
-        key = (row["EU_NUTS_ID"], row["period"], row["subject"])
-        knowledge_spaces[key].append(embeddings[idx])
+##########################
+# Internal Embedding & Centroid
+##########################
+rows_know = []    
+rows_cent = []    
+centroids_by_id = {}
 
-    # Save knowledge spaces as NPZ
-    npz_dict = {}
-    for (nuts, period, subject), vecs in knowledge_spaces.items():
-        k = f"{nuts}||{period}||{subject}"
-        npz_dict[k] = np.vstack(vecs) if len(vecs) > 0 else np.zeros((0, embeddings.shape[1]), dtype=embeddings.dtype)
-    np.savez_compressed(os.path.join(OUTPUT_DIR, "knowledge_spaces.npz"), **npz_dict)
-
-    # 1) 2_knowledge_spaces.csv  (per-row vectors as JSON strings)
-    ks_rows = []
-    for (nuts, period, subject), vecs in knowledge_spaces.items():
-        for vec in vecs:
-            ks_rows.append({
-                "EU_NUTS_ID": nuts,
-                "period": period,
-                "subject": subject,
-                "embedding": json.dumps(vec.tolist(), ensure_ascii=False)
-            })
-    pd.DataFrame(ks_rows, columns=["EU_NUTS_ID", "period", "subject", "embedding"]).to_csv(
-        os.path.join(OUTPUT_DIR, "2_knowledge_spaces.csv"), index=False
+pbar_ids_p1 = tqdm(ID_list, desc="Pass1 INTERNAL (per ID)", unit="ID")
+for the_id in pbar_ids_p1:
+    df_int = (
+        affinst.loc[affinst["ID"] == the_id]
+        .query('type == "Internal"')
+        .merge(publication, on="pubid", how="inner")
+        .copy()
     )
 
-    # 2) centroids.csv (as before) + 2_centroids.csv (same content, different filename)
-    rows = []
-    for (nuts, period, subject), vecs in knowledge_spaces.items():
-        if len(vecs) == 0:
+    before = len(df_int)
+        
+    df_int = df_int[df_int["abstract"].notna() & (df_int["abstract"].str.strip() != "")]
+    filtered = len(df_int)
+    if df_int.empty:
+        pbar_ids_p1.set_postfix(skipped="no-internal")
+        continue
+
+    df_int["input_text"] = df_int["abstract"].fillna("")
+
+    emb_mat = encode_texts(df_int["input_text"].tolist())
+
+    # Remove NaN/Inf
+    finite_mask = np.isfinite(emb_mat).all(axis=1)
+    kept = int(finite_mask.sum())
+    if kept == 0:
+        pbar_ids_p1.set_postfix(skipped="invalid-emb")
+        continue
+    df_int = df_int.loc[finite_mask].reset_index(drop=True)
+    emb_mat = emb_mat[finite_mask]
+    df_int["__emb_vec"] = list(emb_mat)
+
+    pbar_ids_p1.set_postfix(rows=f"{kept}/{before}")
+
+    if SAVE_KNOW:
+        rows_know.extend([{
+            "ID": the_id,
+            "EU_NUTS_ID": r["EU_NUTS_ID"],
+            "period": r["period"],
+            "subject": r["subject"],
+            "pubid": r["pubid"],
+            "embedding": vec_to_str(r["__emb_vec"]),
+        } for _, r in df_int.iterrows()])
+
+    # Measure centroid - doc embedding is already normalized -. take average and normalize again
+    centroids_by_id[the_id] = {}
+    grp = df_int.groupby(["EU_NUTS_ID", "period", "subject"], dropna=False)["__emb_vec"].apply(list)
+
+    for (nuts, per, subj), vec_list in tqdm(grp.items(), desc="  Build centroids", leave=False):
+        if len(vec_list) == 0:
             continue
-        arr = np.vstack(vecs)
-        centroid = arr.mean(axis=0)
-        rows.append({
+        mat = np.vstack(vec_list).astype(np.float32)
+        centroid = mat.mean(axis=0)
+        centroid = l2_normalize(centroid.reshape(1, -1))[0]  
+        centroids_by_id[the_id][(nuts, per, subj)] = centroid
+
+        rows_cent.append({
+            "ID": the_id,
             "EU_NUTS_ID": nuts,
-            "period": period,
-            "subject": subject,
-            "centroid": json.dumps(centroid.tolist(), ensure_ascii=False)
+            "period": per,
+            "subject": subj,
+            "centroid": vec_to_str(centroid),
+            "n_docs": mat.shape[0],
         })
-    centroids_df = pd.DataFrame(rows, columns=["EU_NUTS_ID", "period", "subject", "centroid"])
-    centroids_df.to_csv(os.path.join(OUTPUT_DIR, "centroids.csv"), index=False)
-    centroids_df.to_csv(os.path.join(OUTPUT_DIR, "2_centroids.csv"), index=False)
 
-    print(f"Done. Saved to: {OUTPUT_DIR}")
-    print("Files: embeddings.npy, row_index.csv, knowledge_spaces.npz, 2_knowledge_spaces.csv, centroids.csv, 2_centroids.csv")
+df_know = pd.DataFrame(rows_know) if rows_know else pd.DataFrame()
+df_cent  = pd.DataFrame(rows_cent) if rows_cent else pd.DataFrame()
 
-if __name__ == "__main__":
-    main()
+if SAVE_KNOW and not df_know.empty:
+    save_tables(df_know, OUT_KNOW_PARQUET, OUT_KNOW_FEATHER, label="knowledge_spaces")
+save_tables(df_cent, OUT_CENT_PARQUET, OUT_CENT_FEATHER, label="centroids")
+
+##########################
+# External Embedding & Novelty
+##########################
+rows_ext = []
+pbar_ids_p2 = tqdm(ID_list, desc="Pass2 EXTERNAL (per ID)", unit="ID")
+
+for the_id in pbar_ids_p2:
+    df_ext = (
+        affinst.loc[affinst["ID"] == the_id]
+        .query('type == "External"')
+        .merge(publication, on="pubid", how="inner")
+        .copy()
+    )
+
+    before = len(df_ext)
+
+    df_ext = df_ext[df_ext["abstract"].notna() & (df_ext["abstract"].str.strip() != "")]
+    filtered = len(df_ext)
+    if df_ext.empty:
+        pbar_ids_p2.set_postfix(skipped="no-external")
+        continue
+
+    df_ext["input_text"] = df_ext["abstract"].fillna("")
+
+    emb_ext = encode_texts(df_ext["input_text"].tolist())
+
+    # Remove NaN/Inf
+    finite_mask = np.isfinite(emb_ext).all(axis=1)
+    kept = int(finite_mask.sum())
+    if kept == 0:
+        pbar_ids_p2.set_postfix(skipped="invalid-emb")
+        continue
+    df_ext = df_ext.loc[finite_mask].reset_index(drop=True)
+    emb_ext = emb_ext[finite_mask]
+    df_ext["__emb_vec"] = list(emb_ext)
+
+    # load the centroids for this ID
+    id_centroids = centroids_by_id.get(the_id, {})
+    if not id_centroids:
+        pbar_ids_p2.set_postfix(skipped="no-centroid")
+        continue
+
+    # measure cosine similarity 
+    def compute_novelty(row):
+        key = (row['EU_NUTS_ID'], row['period'], row['subject'])
+        centroid = id_centroids.get(key)
+        if centroid is None:
+            return np.nan
+        v = row["__emb_vec"]
+        return cosine_distance_from_normalized(v, centroid)
+
+    df_ext["content_novelty"] = df_ext.apply(compute_novelty, axis=1)
+
+    n_nan = int(df_ext["content_novelty"].isna().sum())
+    n_val = len(df_ext) - n_nan
+    pbar_ids_p2.set_postfix(rows=f"{kept}/{before}", novelty_ok=n_val, novelty_nan=n_nan)
+
+    rows_ext.extend(df_ext[[
+        "ID","EU_NUTS_ID","period","subject","pubid","content_novelty"
+    ]].to_dict("records"))
+
+df_ext_out = pd.DataFrame(rows_ext) if rows_ext else pd.DataFrame()
+save_tables(df_ext_out, OUT_EXT_PARQUET, OUT_EXT_FEATHER, label="external_novelty")
