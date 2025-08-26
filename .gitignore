@@ -1,1 +1,5 @@
 *.csv
+*_old.csv
+*_old.py
+*_old2.py
+*_old.ipynb
