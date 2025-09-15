@@ -1,5 +1,5 @@
 import os
-os.environ["XFORMERS_DISABLED"] = "1"   # xFormers FMHA deactivate
+os.environ["XFORMERS_DISABLED"] = "1"  # xFormers FMHA deactivate
 import pandas as pd
 import numpy as np
 import torch
@@ -12,22 +12,24 @@ except Exception:
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
-### Settings 
+### Settings
 SAVE_PATH = r"D:/LLM/specter"
 DATA_DIR  = r"D:/DataforPractice/ContentNovelty/"
 
 OUT_KNOW_PARQUET = os.path.join(DATA_DIR, "2_knowledge_spaces.parquet")
 OUT_CENT_PARQUET = os.path.join(DATA_DIR, "2_centroids.parquet")
 OUT_EXT_PARQUET  = os.path.join(DATA_DIR, "3_external_with_novelty.parquet")
+OUT_INT_NOV_PARQUET = os.path.join(DATA_DIR, "3_internal_with_novelty.parquet")
+OUT_INT_NOV_FEATHER = os.path.join(DATA_DIR, "3_internal_with_novelty.feather")
 
 OUT_KNOW_FEATHER = os.path.join(DATA_DIR, "2_knowledge_spaces.feather")
 OUT_CENT_FEATHER = os.path.join(DATA_DIR, "2_centroids.feather")
 OUT_EXT_FEATHER  = os.path.join(DATA_DIR, "3_external_with_novelty.feather")
 
 BATCH_SIZE  = 32
-MAX_LENGTH  = 256   
-NORMALIZE   = True  
-SAVE_KNOW   = True  
+MAX_LENGTH  = 256
+NORMALIZE   = True
+SAVE_KNOW   = True
 
 ### Dependencies Check
 try:
@@ -35,7 +37,7 @@ try:
 except Exception as e:
     raise RuntimeError(
         "This script saves tables in Parquet/Feather. Please install pyarrow:\n"
-        "    pip install pyarrow"
+        "     pip install pyarrow"
     ) from e
 
 ### Model Load
@@ -97,8 +99,9 @@ tqdm.write(f"Total unique IDs: {len(ID_list):,}")
 ##########################
 # Internal Embedding & Centroid
 ##########################
-rows_know = []    
-rows_cent = []    
+rows_know = []
+rows_cent = []
+rows_int_novelty = []  
 centroids_by_id = {}
 
 pbar_ids_p1 = tqdm(ID_list, desc="Pass1 INTERNAL (per ID)", unit="ID")
@@ -111,9 +114,8 @@ for the_id in pbar_ids_p1:
     )
 
     before = len(df_int)
-        
+    
     df_int = df_int[df_int["abstract"].notna() & (df_int["abstract"].str.strip() != "")]
-    filtered = len(df_int)
     if df_int.empty:
         pbar_ids_p1.set_postfix(skipped="no-internal")
         continue
@@ -122,7 +124,6 @@ for the_id in pbar_ids_p1:
 
     emb_mat = encode_texts(df_int["input_text"].tolist())
 
-    # Remove NaN/Inf
     finite_mask = np.isfinite(emb_mat).all(axis=1)
     kept = int(finite_mask.sum())
     if kept == 0:
@@ -134,43 +135,53 @@ for the_id in pbar_ids_p1:
 
     pbar_ids_p1.set_postfix(rows=f"{kept}/{before}")
 
+    # Centroid computation
+    centroids_by_id[the_id] = {}
+    grp = df_int.groupby(["EU_NUTS_ID", "period", "subject"], dropna=False)["__emb_vec"].apply(list)
+    for (nuts, per, subj), vec_list in tqdm(grp.items(), desc="  Build centroids", leave=False):
+        if len(vec_list) == 0: continue
+        mat = np.vstack(vec_list).astype(np.float32)
+        centroid = mat.mean(axis=0)
+        centroid = l2_normalize(centroid.reshape(1, -1))[0]
+        centroids_by_id[the_id][(nuts, per, subj)] = centroid
+        rows_cent.append({
+            "ID": the_id, "EU_NUTS_ID": nuts, "period": per, "subject": subj,
+            "centroid": vec_to_str(centroid), "n_docs": mat.shape[0],
+        })
+
+    id_centroids = centroids_by_id.get(the_id, {})
+    if id_centroids:
+        def compute_internal_novelty(row):
+            key = (row['EU_NUTS_ID'], row['period'], row['subject'])
+            centroid = id_centroids.get(key)
+            if centroid is None: return np.nan
+            v = row["__emb_vec"]
+            return cosine_distance_from_normalized(v, centroid)
+        df_int["content_novelty"] = df_int.apply(compute_internal_novelty, axis=1)
+    else:
+        df_int["content_novelty"] = np.nan
+
     if SAVE_KNOW:
         rows_know.extend([{
-            "ID": the_id,
-            "EU_NUTS_ID": r["EU_NUTS_ID"],
-            "period": r["period"],
-            "subject": r["subject"],
-            "pubid": r["pubid"],
+            "ID": the_id, "EU_NUTS_ID": r["EU_NUTS_ID"], "period": r["period"],
+            "subject": r["subject"], "pubid": r["pubid"],
             "embedding": vec_to_str(r["__emb_vec"]),
         } for _, r in df_int.iterrows()])
 
-    # Measure centroid - doc embedding is already normalized -. take average and normalize again
-    centroids_by_id[the_id] = {}
-    grp = df_int.groupby(["EU_NUTS_ID", "period", "subject"], dropna=False)["__emb_vec"].apply(list)
-
-    for (nuts, per, subj), vec_list in tqdm(grp.items(), desc="  Build centroids", leave=False):
-        if len(vec_list) == 0:
-            continue
-        mat = np.vstack(vec_list).astype(np.float32)
-        centroid = mat.mean(axis=0)
-        centroid = l2_normalize(centroid.reshape(1, -1))[0]  
-        centroids_by_id[the_id][(nuts, per, subj)] = centroid
-
-        rows_cent.append({
-            "ID": the_id,
-            "EU_NUTS_ID": nuts,
-            "period": per,
-            "subject": subj,
-            "centroid": vec_to_str(centroid),
-            "n_docs": mat.shape[0],
-        })
+    rows_int_novelty.extend(
+        df_int[["ID", "EU_NUTS_ID", "period", "subject", "pubid", "content_novelty"]]
+        .to_dict("records")
+    )
 
 df_know = pd.DataFrame(rows_know) if rows_know else pd.DataFrame()
 df_cent  = pd.DataFrame(rows_cent) if rows_cent else pd.DataFrame()
+df_int_nov = pd.DataFrame(rows_int_novelty) if rows_int_novelty else pd.DataFrame()
 
 if SAVE_KNOW and not df_know.empty:
     save_tables(df_know, OUT_KNOW_PARQUET, OUT_KNOW_FEATHER, label="knowledge_spaces")
 save_tables(df_cent, OUT_CENT_PARQUET, OUT_CENT_FEATHER, label="centroids")
+save_tables(df_int_nov, OUT_INT_NOV_PARQUET, OUT_INT_NOV_FEATHER, label="internal_novelty")
+
 
 ##########################
 # External Embedding & Novelty
@@ -189,7 +200,6 @@ for the_id in pbar_ids_p2:
     before = len(df_ext)
 
     df_ext = df_ext[df_ext["abstract"].notna() & (df_ext["abstract"].str.strip() != "")]
-    filtered = len(df_ext)
     if df_ext.empty:
         pbar_ids_p2.set_postfix(skipped="no-external")
         continue
@@ -198,7 +208,6 @@ for the_id in pbar_ids_p2:
 
     emb_ext = encode_texts(df_ext["input_text"].tolist())
 
-    # Remove NaN/Inf
     finite_mask = np.isfinite(emb_ext).all(axis=1)
     kept = int(finite_mask.sum())
     if kept == 0:
@@ -208,13 +217,11 @@ for the_id in pbar_ids_p2:
     emb_ext = emb_ext[finite_mask]
     df_ext["__emb_vec"] = list(emb_ext)
 
-    # load the centroids for this ID
     id_centroids = centroids_by_id.get(the_id, {})
     if not id_centroids:
         pbar_ids_p2.set_postfix(skipped="no-centroid")
         continue
 
-    # measure cosine similarity 
     def compute_novelty(row):
         key = (row['EU_NUTS_ID'], row['period'], row['subject'])
         centroid = id_centroids.get(key)
