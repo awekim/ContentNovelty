@@ -27,10 +27,9 @@ OUT_KNOW_FEATHER = os.path.join(DATA_DIR, "Paper/2_knowledge_spaces.feather")
 OUT_CENT_FEATHER = os.path.join(DATA_DIR, "Paper/2_centroids.feather")
 OUT_EXT_FEATHER  = os.path.join(DATA_DIR, "Paper/3_external_with_novelty.feather")
 
-# ADDED: CSV output paths
+# CSV output paths
 OUT_INT_NOV_CSV = os.path.join(DATA_DIR, "Paper/3_internal_with_novelty.csv")
 OUT_EXT_CSV = os.path.join(DATA_DIR, "Paper/3_external_with_novelty.csv")
-
 
 BATCH_SIZE  = 32
 MAX_LENGTH  = 256
@@ -47,8 +46,6 @@ except Exception as e:
     ) from e
 
 ### Model Load
-# Note: Ensure this path uses backslashes for Windows if you encounter path errors.
-# Example: SAVE_PATH = r"F:\LLM\specter2_base"
 tokenizer = AutoTokenizer.from_pretrained(SAVE_PATH)
 model = AutoModel.from_pretrained(SAVE_PATH)
 model.eval()
@@ -144,7 +141,6 @@ for the_id in pbar_ids_p1:
 
     pbar_ids_p1.set_postfix(rows=f"{kept}/{before}")
 
-    # Centroid computation
     centroids_by_id[the_id] = {}
     grp = df_int.groupby(["period", "subject"], dropna=False)["__emb_vec"].apply(list)
     
@@ -175,11 +171,12 @@ for the_id in pbar_ids_p1:
 
     if SAVE_KNOW:
         rows_know.extend([{
-            "ID": the_id, "EU_NUTS_ID": r["EU_NUTS_ID"], "period": r["period"],
+            "ID": the_id, "period": r["period"],
             "subject": r["subject"], "pubid": r["pubid"],
             "embedding": vec_to_str(r["__emb_vec"]),
         } for _, r in df_int.iterrows()])
     
+    # EU_NUTS_ID가 없는 최종 결과 저장
     rows_int_novelty.extend(
         df_int[["ID", "period", "subject", "pubid", "content_novelty"]]
         .to_dict("records")
@@ -252,7 +249,6 @@ for the_id in pbar_ids_p2:
 
 df_ext_out = pd.DataFrame(rows_ext) if rows_ext else pd.DataFrame()
 save_tables(df_ext_out, OUT_EXT_PARQUET, OUT_EXT_FEATHER, label="external_novelty")
-
 
 if not df_int_nov.empty:
     df_int_nov.to_csv(OUT_INT_NOV_CSV, index=False, encoding='utf-8-sig')
