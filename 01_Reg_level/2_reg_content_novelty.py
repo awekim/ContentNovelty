@@ -13,18 +13,18 @@ from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
 ### Settings
-SAVE_PATH = r"D:/LLM/specter"
-DATA_DIR  = r"D:/DataforPractice/ContentNovelty/"
+SAVE_PATH = r"F:/LLM/specter2_base"
+DATA_DIR  = r"F:/DataforPractice/ContentNovelty/"
 
-OUT_KNOW_PARQUET = os.path.join(DATA_DIR, "2_knowledge_spaces.parquet")
-OUT_CENT_PARQUET = os.path.join(DATA_DIR, "2_centroids.parquet")
-OUT_EXT_PARQUET  = os.path.join(DATA_DIR, "3_external_with_novelty.parquet")
-OUT_INT_NOV_PARQUET = os.path.join(DATA_DIR, "3_internal_with_novelty.parquet")
-OUT_INT_NOV_FEATHER = os.path.join(DATA_DIR, "3_internal_with_novelty.feather")
+OUT_KNOW_PARQUET = os.path.join(DATA_DIR, "Region/2_knowledge_spaces.parquet")
+OUT_CENT_PARQUET = os.path.join(DATA_DIR, "Region/2_centroids.parquet")
+OUT_EXT_PARQUET  = os.path.join(DATA_DIR, "Region/3_external_with_novelty.parquet")
+OUT_INT_NOV_PARQUET = os.path.join(DATA_DIR, "Region/3_internal_with_novelty.parquet")
+OUT_INT_NOV_FEATHER = os.path.join(DATA_DIR, "Region/3_internal_with_novelty.feather")
 
-OUT_KNOW_FEATHER = os.path.join(DATA_DIR, "2_knowledge_spaces.feather")
-OUT_CENT_FEATHER = os.path.join(DATA_DIR, "2_centroids.feather")
-OUT_EXT_FEATHER  = os.path.join(DATA_DIR, "3_external_with_novelty.feather")
+OUT_KNOW_FEATHER = os.path.join(DATA_DIR, "Region/2_knowledge_spaces.feather")
+OUT_CENT_FEATHER = os.path.join(DATA_DIR, "Region/2_centroids.feather")
+OUT_EXT_FEATHER  = os.path.join(DATA_DIR, "Region/3_external_with_novelty.feather")
 
 BATCH_SIZE  = 32
 MAX_LENGTH  = 256
