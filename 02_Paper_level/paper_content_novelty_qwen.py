@@ -12,7 +12,7 @@ import gc
 # 1. 설정 (Settings)
 # ==========================================
 # 로컬 모델 경로 (이미 다운로드 완료된 경로)
-LOCAL_MODEL_PATH = r"F:/LLM/qwen3_emb_8b"
+LOCAL_MODEL_PATH = r"F:/LLM/qwen3_emb_0.6b"
 DATA_DIR  = r"E:/Data_for_Practice/ContentNovelty/"
 
 # RTX 5090 최적화 설정
