@@ -55,7 +55,7 @@ def encode_texts(texts, tokenizer, model, device, batch_size=32, max_length=256,
 
 if __name__ == "__main__":
     if not TARGET_COMBINATIONS:
-        raise ValueError("TARGET_COMBINATIONS 리스트가 비어있습니다. 분석할 조합을 1개 이상 추가하세요.")
+        raise ValueError("TARGET_COMBINATIONS list missing.")
 
     print(f"Initial setup... Analyzing {len(TARGET_COMBINATIONS)} specific combinations.")
     os.makedirs(KNOW_SUBDIR, exist_ok=True)
